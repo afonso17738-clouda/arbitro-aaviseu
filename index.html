@@ -251,135 +251,95 @@ async function parsePDF(file,settings){
     if(jn&&seenJns.has(jn))continue;
     if(jn)seenJns.add(jn);
 
-    // ── PO EXTRACTION (3 strategies, most-robust first) ─────────
-    let po='';
-
-    // Strategy A: positional — "last 3 pure-number items before the first NAME-ID item"
-    //   Table order: ... PO SERIE JOR  [FirstName] [LastName-ID] ...
-    //   The last 3 numbers before NAME-ID are always PO, SERIE, JOR
+    // ── PO EXTRACTION + poItemIdx ────────────────────────────────
+    // Primary strategy: last 3 pure-number items before the first NAME-ID item
+    // are always PO, SERIE, JOR (in column order).
+    let po='', poItemIdx=-1;
     {
       const firstArbIdx=rowItems.findIndex(it=>/-\d{5,6}$/.test(it.text));
       if(firstArbIdx>0){
         const preArbNums=rowItems
           .slice(0,firstArbIdx)
-          .filter(it=>/^\d{1,3}$/.test(it.text));
-        // last 3 numbers: [..., PO, SERIE, JOR] — take first of last-3
+          .map((it,i)=>({it,i}))
+          .filter(({it})=>/^\d{1,3}$/.test(it.text));
         const last3=preArbNums.slice(-3);
-        if(last3.length>=1)po=String(parseInt(last3[0].text)).padStart(2,'0');
-      }
-    }
-
-    // Strategy B: text-based — find "vs TEAMB NUMBER NUMBER NUMBER"
-    if(!po){
-      const vsPos=up.indexOf(' VS ');
-      if(vsPos>=0){
-        const afterVs=line.substring(vsPos+4);
-        const toks=afterVs.trim().split(/\s+/);
-        const numRun=[];
-        let passedTeam=false;
-        for(const tok of toks){
-          if(/^\d{1,3}$/.test(tok)){passedTeam=true;numRun.push(tok);if(numRun.length===3)break;}
-          else if(passedTeam&&numRun.length>0)break;
-          else passedTeam=true;
+        if(last3.length>=1){
+          po=String(parseInt(last3[0].it.text)).padStart(2,'0');
+          poItemIdx=last3[0].i;
         }
-        if(numRun.length>=1)po=String(parseInt(numRun[0])).padStart(2,'0');
+      }
+      // Fallback: regex on full line
+      if(!po){
+        const m=line.match(/\b(\d{1,2})\s+\d{1,2}\s+\d{1,3}\s+[A-Z]/);
+        if(m)po=String(parseInt(m[1])).padStart(2,'0');
       }
     }
-
-    // Strategy C: regex fallback
-    if(!po){
-      const m=line.match(/\b(?:vs|VS|x|X)\s+\S+\s+(\d{1,2})\s+\d{1,2}\s+\d{1,3}/i);
-      if(m)po=String(parseInt(m[1])).padStart(2,'0');
-    }
-    // ── END PO EXTRACTION ────────────────────────────────────────
 
     // ── ARBITERS ────────────────────────────────────────────────
-    // Find LASTNAME-ID items (e.g. "FERNANDES-233690")
     const arbItems=rowItems.filter(it=>/-\d{5,6}$/.test(it.text));
     const arbs=arbItems.map(it=>{
       const dash=it.text.lastIndexOf('-');
       return{name:it.text.substring(0,dash).trim(),id:it.text.substring(dash+1)};
     });
     if(arbs.length===0){
-      // Fallback: regex on full line for "LASTNAME-ID" or "FULLNAME-ID"
       const ap=/([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ][A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ]+)-(\d{5,6})/g;
       let m2;while((m2=ap.exec(up))!==null)arbs.push({name:m2[1].trim(),id:m2[2]});
     }
 
-    // ── TEAMS + LOCAL (positional, not regex) ────────────────────
-    // Uses X-positions of rowItems to split columns reliably.
-    // Column order (left→right): date time JN [LOCAL words] [teamA words] vs [teamB words] PO SERIE JOR arbs
+    // ── TEAMS + LOCAL ────────────────────────────────────────────
+    // Real PDF column order (no "vs" separator in this PDF format):
+    //   DATE  TIME  JN  LOCAL  TEAM_A  TEAM_B  PO  SERIE  JOR  ARB1  ARB2
+    // Strategy: get items between JN and PO, assign by position.
     let teamA='',teamB='',local='';
     {
-      // Find "vs" — could be a standalone item OR embedded in "ACOF vs CBVISEU"
-      let vsIdx=-1;
-      let embeddedTeams=null; // {a, b} if "ACOF vs CBVISEU" is one item
+      // Determine end boundary: PO item index (or first arb if PO not found)
+      const endIdx = poItemIdx>0 ? poItemIdx :
+        rowItems.findIndex(it=>/-\d{5,6}$/.test(it.text));
 
-      for(let i=0;i<rowItems.length;i++){
+      // Skip leftmost header columns: date, time, JN
+      let startIdx=0;
+      for(let i=0;i<(endIdx>0?endIdx:rowItems.length);i++){
         const t=rowItems[i].text;
-        if(/^(vs|x)$/i.test(t)){vsIdx=i;break;}
-        // Embedded: "ACOF vs CBVISEU" or "ACOF X CBVISEU"
-        const em=t.match(/^(.+?)\s+(?:vs|x)\s+(.+)$/i);
-        if(em){embeddedTeams={a:em[1].trim(),b:em[2].trim()};vsIdx=i;break;}
+        if(/^\d{2}[-.]\d{2}[-.]\d{4}$/.test(t)||/^\d{2}:\d{2}$/.test(t)||(jn&&t===jn))
+          startIdx=i+1;
       }
 
-      if(embeddedTeams){
-        // JOGOS was one PDF cell: easy case
-        teamA=embeddedTeams.a;
-        teamB=embeddedTeams.b;
-        // LOCAL = items between date/time/JN and this vs-container item
-        let start2=0;
-        for(let i=0;i<vsIdx;i++){
-          const t=rowItems[i].text;
-          if(/^\d{2}-\d{2}-\d{4}$/.test(t)||/^\d{2}:\d{2}$/.test(t)||(jn&&t===jn))start2=i+1;
-        }
-        local=rowItems.slice(start2,vsIdx).map(it=>it.text).join(' ').trim();
+      const mid=rowItems.slice(startIdx, endIdx>0?endIdx:undefined);
 
-      } else if(vsIdx>=0){
-        // "vs" is a separate item — use X-gap heuristic to split LOCAL from teamA
-        // TeamB: consecutive non-digit, non-arbID items after "vs"
-        const tbParts=[];
-        for(let i=vsIdx+1;i<rowItems.length;i++){
-          const t=rowItems[i].text;
-          if(/^\d/.test(t)||/-\d{5,6}$/.test(t))break;
-          tbParts.push(t);
-        }
-        teamB=tbParts.join(' ');
+      // Also handle "vs" embedded in one item or as separate item
+      const vsInMid=mid.findIndex(it=>/^(vs|x)$/i.test(it.text));
+      const embIdx=mid.findIndex(it=>/\b(vs|x)\b/i.test(it.text)&&it.text.length>2);
 
-        // Items between JN and "vs" — skip date/time/JN items (leftmost cols)
-        let start=0;
-        for(let i=0;i<vsIdx;i++){
-          const t=rowItems[i].text;
-          if(/^\d{2}-\d{2}-\d{4}$/.test(t)||/^\d{2}:\d{2}$/.test(t)||(jn&&t===jn))start=i+1;
-        }
-        const mid=rowItems.slice(start,vsIdx);
-
-        if(mid.length===0){
-          // nothing between JN and vs — no teamA or local
-        } else if(mid.length===1){
-          teamA=mid[0].text; // single item = just teamA
+      if(vsInMid>=0){
+        // "vs" is a standalone item
+        local =mid.slice(0,vsInMid-1).map(it=>it.text).join(' ').trim();
+        teamA =mid.slice(Math.max(0,vsInMid-1),vsInMid).map(it=>it.text).join(' ').trim();
+        teamB =mid.slice(vsInMid+1).map(it=>it.text).join(' ').trim();
+      } else if(embIdx>=0){
+        // One item contains "vs": "ACOF vs CBVISEU"
+        const em=mid[embIdx].text.match(/^(.+?)\s+(?:vs|x)\s+(.+)$/i);
+        if(em){teamA=em[1].trim();teamB=em[2].trim();}
+        local=mid.slice(0,embIdx).map(it=>it.text).join(' ').trim();
+      } else if(mid.length>=3){
+        // No "vs" — positional assignment:
+        // Use 2 largest X-gaps to split into [LOCAL] [TEAM_A] [TEAM_B]
+        const gaps=mid.slice(1).map((it,i)=>({gap:it.x-mid[i].x,idx:i+1}))
+          .sort((a,b)=>b.gap-a.gap);
+        const splits=gaps.slice(0,2).map(g=>g.idx).sort((a,b)=>a-b);
+        if(gaps[0].gap>15&&gaps.length>=2){
+          local=mid.slice(0,splits[0]).map(it=>it.text).join(' ').trim();
+          teamA=mid.slice(splits[0],splits[1]).map(it=>it.text).join(' ').trim();
+          teamB=mid.slice(splits[1]).map(it=>it.text).join(' ').trim();
         } else {
-          // Find the LARGEST X-gap between consecutive items.
-          // That gap is the column boundary between LOCAL and teamA.
-          let maxGap=0,splitAt=mid.length-1; // default: last item = teamA
-          for(let i=1;i<mid.length;i++){
-            const gap=mid[i].x-mid[i-1].x;
-            if(gap>maxGap){maxGap=gap;splitAt=i;}
-          }
-          // Only split at gap if it's clearly bigger than normal word spacing (~15px)
-          if(maxGap>20){
-            local=mid.slice(0,splitAt).map(it=>it.text).join(' ').trim();
-            teamA=mid.slice(splitAt).map(it=>it.text).join(' ').trim();
-          } else {
-            // No clear column gap: assume last item is teamA, rest is local
-            local=mid.slice(0,-1).map(it=>it.text).join(' ').trim();
-            teamA=mid[mid.length-1].text;
-          }
+          // All items close together — assign positionally
+          local=mid[0].text;
+          teamA=mid[1].text;
+          teamB=mid.slice(2).map(it=>it.text).join(' ').trim();
         }
-      } else {
-        // No "vs" found at all — last-resort regex on full line
-        const m3=line.match(/\b([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ\d]{2,})\s+(?:vs|x)\s+([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ\d]{2,})/i);
-        if(m3){teamA=m3[1];teamB=m3[2];}
+      } else if(mid.length===2){
+        teamA=mid[0].text; teamB=mid[1].text;
+      } else if(mid.length===1){
+        local=mid[0].text;
       }
     }
 
