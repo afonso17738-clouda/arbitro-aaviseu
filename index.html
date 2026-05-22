@@ -194,6 +194,97 @@ async function getRouteKm(lat1,lon1,lat2,lon2){
 }
 async function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
+// ── KM ENGINE ─────────────────────────────────────────────────
+// Geocode a pavilhão address and calculate road distance from home.
+// Returns updated pavilhão object.
+async function geocodePavilhaoFull(pav, homeCoords) {
+  const coords = await geocodeAddress(pav.address);
+  if (!coords) return {...pav, needsAddress: true};
+  let dist = null;
+  if (homeCoords) dist = await getRouteKm(homeCoords.lat, homeCoords.lon, coords.lat, coords.lon);
+  return {...pav, lat: coords.lat, lon: coords.lon, distanceKm: dist, needsAddress: false};
+}
+
+// Sync distanceKm from pavilhões to games (called after geocoding)
+function syncPavKmToGames(games, pavilhoes) {
+  return games.map(g => {
+    if (!g.pavilhaoId) return g;
+    const pav = pavilhoes.find(p => p.id === g.pavilhaoId);
+    if (pav?.distanceKm != null && g.distanceKm !== pav.distanceKm)
+      return {...g, distanceKm: pav.distanceKm};
+    return g;
+  });
+}
+
+// Calculate route for a single day: Home→V1→[V2→…]→Home
+// Returns { totalKm, segments:[{from,to,km}], note, status }
+async function calcOneDayRoute(dayGames, pavilhoes, homeCoords) {
+  if (!homeCoords) return {status:'no_home'};
+  // Collect unique venues in game order
+  const seen = new Set();
+  const venues = [];
+  for (const g of dayGames) {
+    if (!g.pavilhaoId) continue;
+    const pav = pavilhoes.find(p => p.id === g.pavilhaoId);
+    if (pav?.lat && pav?.lon && !seen.has(pav.id)) {
+      seen.add(pav.id); venues.push(pav);
+    }
+  }
+  if (!venues.length) return {status:'no_location'};
+
+  const pts = [homeCoords, ...venues, homeCoords];
+  const segments = [];
+  try {
+    for (let i = 0; i < pts.length - 1; i++) {
+      await sleep(350); // OSRM rate limit
+      const km = await getRouteKm(pts[i].lat, pts[i].lon, pts[i+1].lat, pts[i+1].lon);
+      if (km === null) return {status:'osrm_error'};
+      const from = i === 0 ? 'Casa' : venues[i-1].alias;
+      const to   = i === pts.length-2 ? 'Casa' : venues[i].alias;
+      segments.push({from, to, km: Math.round(km*10)/10});
+    }
+  } catch(e) { return {status:'error', msg: e.message}; }
+
+  const totalKm = Math.round(segments.reduce((s,seg)=>s+seg.km,0)*10)/10;
+  const note = segments.map(s=>`${s.from}→${s.to} (${s.km}km)`).join(' + ');
+  return {status:'ok', totalKm, segments, note,
+    venueCount: venues.length, gameCount: dayGames.length};
+}
+
+// Calculate ALL daily routes for all active games
+async function calcAllDailyRoutes(games, pavilhoes, settings, onProgress) {
+  const homeCoords = settings.homeCoords;
+  // Group active games (with pavilhão) by date
+  const byDate = {};
+  games.filter(g => g.status !== 'cancelado').forEach(g => {
+    if (!byDate[g.date]) byDate[g.date] = [];
+    byDate[g.date].push(g);
+  });
+  const dates = Object.keys(byDate).sort();
+  const routes = {};
+  for (let i = 0; i < dates.length; i++) {
+    const date = dates[i];
+    onProgress?.(i+1, dates.length, date);
+    routes[date] = await calcOneDayRoute(byDate[date], pavilhoes, homeCoords);
+    await sleep(200);
+  }
+  return routes;
+}
+
+// Get km euros for a day using dailyRoutes (falls back to per-game estimate)
+function getDayKmEuros(date, games, dailyRoutes, pavilhoes, settings) {
+  const route = dailyRoutes?.[date];
+  if (route?.status === 'ok') return route.totalKm * (settings.kmRate || 0.36);
+  // Fallback: max round-trip distance of any game that day
+  const dayGames = games.filter(g => g.date === date && g.status !== 'cancelado');
+  const maxKm = Math.max(0, ...dayGames.map(g => {
+    const pav = pavilhoes.find(p => p.id === g.pavilhaoId);
+    const d = g.manualKm != null ? g.manualKm : (pav?.distanceKm ?? g.distanceKm ?? 0);
+    return d * 2;
+  }));
+  return maxKm * (settings.kmRate || 0.36);
+}
+
 // ── PDF PARSER ─────────────────────────────────────────────────
 async function parsePDF(file,settings){
   if(!window.pdfjsLib)throw new Error('PDF.js não carregado');
@@ -565,7 +656,7 @@ function NavBar({page,setPage,syncStatus,syncConfigured,onSyncClick}){
 }
 
 // ── DASHBOARD ──────────────────────────────────────────────────
-function Dashboard({games,tournaments,settings}){
+function Dashboard({games,tournaments,settings,dailyRoutes}){
   const now=new Date();
   const curMk=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
   const active=[...games.filter(g=>g.status!=='cancelado'),...tournaments];
@@ -583,7 +674,9 @@ function Dashboard({games,tournaments,settings}){
     return fa.localeCompare(fb);
   }).slice(0,5);
   const seasonTotal=active.reduce((s,g)=>s+calcGameTotals(g,settings).total,0);
-  const totalKm=active.reduce((s,g)=>s+calcGameTotals(g,settings).kmDist*2,0);
+  // Use daily routes km when available, else fallback to per-game round-trip estimate
+  const routeKm=dailyRoutes?Object.values(dailyRoutes).filter(r=>r?.status==='ok').reduce((s,r)=>s+r.totalKm,0):0;
+  const totalKm=routeKm>0?routeKm:active.reduce((s,g)=>s+calcGameTotals(g,settings).kmDist*2,0);
 
   return(
     <div className="space-y-6 fade-in">
@@ -888,15 +981,239 @@ function GameRow({game,settings,pavilhoes,onUpdate,onDelete}){
   );
 }
 
+// ── KM PANEL ───────────────────────────────────────────────────
+function KmPanel({games,setGames,pavilhoes,setPavilhoes,settings,setSettings,dailyRoutes,setDailyRoutes,toast}){
+  const[calcState,setCalcState]=useState('idle'); // idle|geocoding|routing|done
+  const[progress,setProgress]=useState(null);
+  const[geoProgress,setGeoProgress]=useState(null);
+
+  // Games grouped by date (active only)
+  const byDate=useMemo(()=>{
+    const m={};
+    games.filter(g=>g.status!=='cancelado').forEach(g=>{
+      if(!m[g.date])m[g.date]=[];m[g.date].push(g);
+    });
+    return m;
+  },[games]);
+  const dates=useMemo(()=>Object.keys(byDate).sort(),[byDate]);
+
+  // Stats
+  const totalOkDays=Object.values(dailyRoutes).filter(r=>r.status==='ok').length;
+  const totalKmSeason=Object.values(dailyRoutes).filter(r=>r.status==='ok').reduce((s,r)=>s+r.totalKm,0);
+  const missingPavs=pavilhoes.filter(p=>!p.lat||!p.distanceKm);
+  const gamesNoPav=games.filter(g=>g.status!=='cancelado'&&!g.pavilhaoId);
+
+  async function runFull(){
+    setCalcState('geocoding');
+    // Step 1: geocode home if needed
+    let homeCoords=settings.homeCoords;
+    if(!homeCoords){
+      setGeoProgress('A geocodificar morada base...');
+      homeCoords=await geocodeAddress(settings.homeAddress);
+      if(homeCoords){
+        setSettings(s=>({...s,homeCoords}));
+        await sleep(1200);
+      }
+    }
+    // Step 2: geocode pavilhões without coords
+    const needGeo=pavilhoes.filter(p=>!p.lat&&p.address);
+    for(let i=0;i<needGeo.length;i++){
+      const p=needGeo[i];
+      setGeoProgress(`Geocodificar ${i+1}/${needGeo.length}: ${p.alias}`);
+      const updated=await geocodePavilhaoFull(p, homeCoords);
+      setPavilhoes(prev=>prev.map(x=>x.id===p.id?updated:x));
+      // Update games linked to this pavilhão
+      if(updated.distanceKm!=null){
+        setGames(prev=>prev.map(g=>g.pavilhaoId===p.id?{...g,distanceKm:updated.distanceKm}:g));
+      }
+      await sleep(1200); // Nominatim rate limit
+    }
+    setGeoProgress(null);
+
+    // Step 3: re-read latest pavilhões from state (need fresh ref)
+    // Use a fresh snapshot via a small trick: collect from DOM state
+    setCalcState('routing');
+
+    // Get updated pavilhões (need latest state – use a callback)
+    setPavilhoes(currentPavs=>{
+      // Run routing with fresh pavilhões
+      (async()=>{
+        const fresh=currentPavs;
+        // Also sync km from pavilhões to games
+        setGames(gs=>{
+          const synced=syncPavKmToGames(gs,fresh);
+          // Now calculate routes
+          calcAllDailyRoutes(synced, fresh, settings, (i,total,date)=>{
+            setProgress({i,total,date});
+          }).then(routes=>{
+            setDailyRoutes(prev=>({...prev,...routes}));
+            setCalcState('done');
+            setProgress(null);
+            const ok=Object.values(routes).filter(r=>r.status==='ok').length;
+            toast(`✅ ${ok} dia(s) calculado(s)!`);
+          });
+          return synced;
+        });
+      })();
+      return currentPavs;
+    });
+  }
+
+  // Recalculate one specific date
+  async function recalcDay(date){
+    const dayGames=byDate[date]||[];
+    setDailyRoutes(prev=>({...prev,[date]:{status:'loading'}}));
+    // Ensure home coords
+    let homeCoords=settings.homeCoords;
+    if(!homeCoords){homeCoords=await geocodeAddress(settings.homeAddress);if(homeCoords)setSettings(s=>({...s,homeCoords}));}
+    const result=await calcOneDayRoute(dayGames,pavilhoes,homeCoords);
+    setDailyRoutes(prev=>({...prev,[date]:result}));
+    if(result.status==='ok')toast(`${date}: ${result.totalKm}km = ${fmtEuro(result.totalKm*(settings.kmRate||0.36))}`);
+    else toast(`Erro ao calcular ${date}: ${result.status}`,'error');
+  }
+
+  const statusColor={ok:'text-emerald-400',no_location:'text-amber-400',no_home:'text-amber-400',error:'text-red-400',osrm_error:'text-red-400',loading:'text-slate-400',idle:'text-slate-500'};
+  const statusLabel={ok:'✅',no_location:'📍 Sem local',no_home:'🏠 Sem morada base',error:'❌ Erro',osrm_error:'❌ OSRM',loading:'⏳',idle:'—'};
+
+  return(
+    <div className="space-y-4 fade-in">
+      {/* Header & big CTA */}
+      <div className="bg-gradient-to-r from-emerald-900/30 to-teal-900/30 border border-emerald-700/40 rounded-2xl p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <div className="text-lg font-bold">🛣️ Motor de KM Avançado</div>
+            <div className="text-slate-400 text-sm">{settings.kmRate||0.36}€/km · {totalOkDays}/{dates.length} dias calculados · {Math.round(totalKmSeason)} km época</div>
+          </div>
+          <Btn onClick={runFull} disabled={calcState==='geocoding'||calcState==='routing'}
+            variant="success" className="flex items-center gap-2">
+            {calcState==='geocoding'?<><Spinner/> A geocodificar...</>
+             :calcState==='routing'?<><Spinner/> A calcular rotas...</>
+             :'🔄 Calcular Tudo (Geocode + Rotas)'}
+          </Btn>
+        </div>
+        {/* Progress */}
+        {geoProgress&&<div className="text-sm text-amber-300 flex items-center gap-2"><Spinner/>{geoProgress}</div>}
+        {progress&&<div className="text-sm text-emerald-300 flex items-center gap-2"><Spinner/>Dia {progress.i}/{progress.total}: {progress.date}</div>}
+        {/* Issues */}
+        {(missingPavs.length>0||gamesNoPav.length>0)&&(
+          <div className="mt-3 space-y-1">
+            {missingPavs.length>0&&<div className="text-xs text-amber-400">⚠️ {missingPavs.length} pavilhão(ões) sem coordenadas — clica "Calcular Tudo" para geocodificar automaticamente</div>}
+            {gamesNoPav.length>0&&<div className="text-xs text-amber-400">⚠️ {gamesNoPav.length} jogo(s) sem pavilhão associado — associa em Jogos → Editar</div>}
+          </div>
+        )}
+      </div>
+
+      {/* Summary bar */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-emerald-300">{Math.round(totalKmSeason)}</div>
+          <div className="text-xs text-slate-400">km época</div>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-indigo-300">{fmtEuro(totalKmSeason*(settings.kmRate||0.36))}</div>
+          <div className="text-xs text-slate-400">total km €</div>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-amber-300">{fmtEuro(dates.length?totalKmSeason*(settings.kmRate||0.36)/Math.max(1,totalOkDays):0)}</div>
+          <div className="text-xs text-slate-400">média/dia</div>
+        </div>
+      </div>
+
+      {/* Per-day routes */}
+      {dates.length===0?(
+        <div className="text-center py-12 text-slate-500">Sem jogos activos.</div>
+      ):(
+        <div className="space-y-2">
+          <div className="text-xs text-slate-400 uppercase tracking-wide px-1">Trajetos por dia de jogo</div>
+          {dates.map(date=>{
+            const dg=byDate[date];
+            const route=dailyRoutes[date];
+            const uniquePavs=[...new Set(dg.map(g=>{
+              const p=pavilhoes.find(x=>x.id===g.pavilhaoId);
+              return p?.alias||g.local||'?';
+            }))];
+            return(
+              <div key={date} className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+                <div className="flex items-center gap-3 p-3">
+                  {/* Date */}
+                  <div className="min-w-16 text-center flex-shrink-0">
+                    <div className="text-xs text-slate-500">{date.split('-')[1]}/{date.split('-')[2]?.slice(-2)}</div>
+                    <div className="font-bold">{date.split('-')[0]}</div>
+                  </div>
+                  {/* Venues + games */}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium flex items-center gap-1 flex-wrap">
+                      <span className="text-slate-400">Casa</span>
+                      {uniquePavs.map((v,i)=>(
+                        <span key={i} className="flex items-center gap-1">
+                          <span className="text-slate-500">→</span>
+                          <span className="text-indigo-300">{v}</span>
+                        </span>
+                      ))}
+                      <span className="text-slate-500">→ Casa</span>
+                    </div>
+                    <div className="text-xs text-slate-500">{dg.length} jogo(s) · {uniquePavs.length} local(is)</div>
+                    {route?.status==='ok'&&(
+                      <div className="text-xs text-slate-600 mt-0.5">
+                        {route.segments.map((s,i)=>(
+                          <span key={i}>{i>0?' + ':''}{s.from}→{s.to}: {s.km}km</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {/* Result */}
+                  <div className="text-right flex-shrink-0">
+                    {route?.status==='ok'?(
+                      <>
+                        <div className="font-bold text-emerald-300">{route.totalKm} km</div>
+                        <div className="text-sm text-white">{fmtEuro(route.totalKm*(settings.kmRate||0.36))}</div>
+                      </>
+                    ):(
+                      <div className={`text-xs ${statusColor[route?.status||'idle']}`}>
+                        {statusLabel[route?.status||'idle']}
+                        {route?.status==='loading'&&<Spinner/>}
+                      </div>
+                    )}
+                  </div>
+                  {/* Recalc button */}
+                  <Btn size="xs" variant="ghost" onClick={()=>recalcDay(date)}
+                    disabled={route?.status==='loading'}>
+                    {route?.status==='loading'?<Spinner/>:'🔄'}
+                  </Btn>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── MONTHLY SUMMARY ────────────────────────────────────────────
-function MonthlySummary({games,tournaments,settings}){
-  const all=[...games.filter(g=>g.status!=='cancelado'),...tournaments];
+function MonthlySummary({games,tournaments,settings,dailyRoutes,pavilhoes}){
+  const activeGames=games.filter(g=>g.status!=='cancelado');
+  const all=[...activeGames,...tournaments];
   const byMonth={};
+  // First pass: accumulate prize + subsidio; collect unique dates
   all.forEach(g=>{
     const mk=getMonthKey(g.date);if(!mk)return;
-    if(!byMonth[mk])byMonth[mk]={games:[],prize:0,km:0,sub:0,total:0};
+    if(!byMonth[mk])byMonth[mk]={games:[],prize:0,km:0,sub:0,total:0,_dates:new Set()};
     const t=calcGameTotals(g,settings);
-    byMonth[mk].games.push(g);byMonth[mk].prize+=t.prize;byMonth[mk].km+=t.kmEuros;byMonth[mk].sub+=t.subsidio;byMonth[mk].total+=t.total;
+    byMonth[mk].games.push(g);
+    byMonth[mk].prize+=t.prize;
+    byMonth[mk].sub+=t.subsidio;
+    if(g.date)byMonth[mk]._dates.add(g.date);
+  });
+  // Second pass: km per month = sum of getDayKmEuros over unique dates
+  // (uses dailyRoutes when available, falls back to max round-trip per date)
+  Object.keys(byMonth).forEach(mk=>{
+    let kmTotal=0;
+    byMonth[mk]._dates.forEach(date=>{
+      kmTotal+=getDayKmEuros(date,activeGames,dailyRoutes||{},pavilhoes||[],settings);
+    });
+    byMonth[mk].km=kmTotal;
+    byMonth[mk].total=byMonth[mk].prize+byMonth[mk].km+byMonth[mk].sub;
   });
   const months=Object.keys(byMonth).sort();
   if(!months.length)return<div className="text-center py-12 text-slate-500">Sem dados</div>;
@@ -942,7 +1259,7 @@ function MonthlySummary({games,tournaments,settings}){
 }
 
 // ── JOGOS PAGE ─────────────────────────────────────────────────
-function JogosPage({games,setGames,pavilhoes,setPavilhoes,settings,toast}){
+function JogosPage({games,setGames,pavilhoes,setPavilhoes,settings,setSettings,dailyRoutes,setDailyRoutes,toast}){
   const[tab,setTab]=useState('lista');
   const[filter,setFilter]=useState('');
   const[sortKey,setSortKey]=useState('date');
@@ -976,8 +1293,8 @@ function JogosPage({games,setGames,pavilhoes,setPavilhoes,settings,toast}){
         <div><h1 className="text-2xl font-bold">🤾 Jogos</h1><p className="text-slate-500 text-sm">{games.length} jogos registados</p></div>
         <Btn size="sm" onClick={()=>setShowAdd(true)}>+ Adicionar</Btn>
       </div>
-      <div className="flex gap-1 bg-slate-900 rounded-xl p-1">
-        {[['lista','📋 Lista'],['importar','📤 Importar PDF'],['resumo','📊 Resumo']].map(([k,l])=>(
+      <div className="flex gap-1 bg-slate-900 rounded-xl p-1 flex-wrap gap-y-1">
+        {[['lista','📋 Lista'],['importar','📤 Importar PDF'],['resumo','📊 Resumo'],['km','🛣️ KM']].map(([k,l])=>(
           <button key={k} onClick={()=>setTab(k)}
             className={`flex-1 md:flex-none px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all ${tab===k?'bg-indigo-600 text-white':'text-slate-400 hover:text-white'}`}>{l}</button>
         ))}
@@ -997,7 +1314,8 @@ function JogosPage({games,setGames,pavilhoes,setPavilhoes,settings,toast}){
           )}
         </>
       )}
-      {tab==='resumo'&&<MonthlySummary games={games} tournaments={[]} settings={settings}/>}
+      {tab==='resumo'&&<MonthlySummary games={games} tournaments={[]} settings={settings} dailyRoutes={dailyRoutes} pavilhoes={pavilhoes}/>}
+      {tab==='km'&&<KmPanel games={games} setGames={setGames} pavilhoes={pavilhoes} setPavilhoes={setPavilhoes} settings={settings} setSettings={setSettings} dailyRoutes={dailyRoutes||{}} setDailyRoutes={setDailyRoutes} toast={toast}/>}
       {showAdd&&<GameEditModal game={emptyGame} settings={settings} pavilhoes={pavilhoes}
         onSave={g=>{setGames(p=>[...p,g]);setShowAdd(false);toast('Jogo adicionado');}} onClose={()=>setShowAdd(false)}/>}
     </div>
@@ -1446,6 +1764,7 @@ function App(){
   const[tournaments,setTournamentsRaw]=useLocalStorage('tournaments',[]);
   const[pavilhoes,setPavilhoesRaw]=useLocalStorage('pavilhoes',DEFAULT_PAVILHOES);
   const[settings,setSettingsRaw]=useLocalStorage('settings',DEFAULT_SETTINGS);
+  const[dailyRoutes,setDailyRoutesRaw]=useLocalStorage('dailyRoutes',{});
   const{toasts,addToast,removeToast}=useToast();
   const sync=useSupaSync();
   const[showSupaFirst,setShowSupaFirst]=useState(false);
@@ -1472,6 +1791,11 @@ function App(){
     const val=typeof v==='function'?v(settings):v;
     sync.push('settings',val);
   }
+  function setDailyRoutes(v){
+    setDailyRoutesRaw(v);
+    const val=typeof v==='function'?v(dailyRoutes):v;
+    sync.push('dailyRoutes',val);
+  }
 
   // On startup: load from Supabase (overrides localStorage)
   useEffect(()=>{
@@ -1483,6 +1807,7 @@ function App(){
           if(remote.tournaments)setTournamentsRaw(remote.tournaments);
           if(remote.pavilhoes)setPavilhoesRaw(remote.pavilhoes);
           if(remote.settings)setSettingsRaw(remote.settings);
+          if(remote.dailyRoutes)setDailyRoutesRaw(remote.dailyRoutes);
         }
       } else if(!localStorage.getItem('supa_first_shown')){
         // Show setup on first launch
@@ -1529,8 +1854,8 @@ function App(){
       <NavBar page={page} setPage={setPage} syncStatus={sync.status} syncConfigured={sync.configured}
         onSyncClick={()=>setPage('definicoes')}/>
       <main className="md:pl-56 pb-24 md:pb-8 px-4 pt-4 max-w-5xl">
-        {page==='dashboard'&&<Dashboard games={games} tournaments={tournaments} settings={settings}/>}
-        {page==='jogos'&&<JogosPage games={games} setGames={setGames} pavilhoes={pavilhoes} setPavilhoes={setPavilhoes} settings={settings} toast={addToast}/>}
+        {page==='dashboard'&&<Dashboard games={games} tournaments={tournaments} settings={settings} dailyRoutes={dailyRoutes}/>}
+        {page==='jogos'&&<JogosPage games={games} setGames={setGames} pavilhoes={pavilhoes} setPavilhoes={setPavilhoes} settings={settings} setSettings={setSettings} dailyRoutes={dailyRoutes} setDailyRoutes={setDailyRoutes} toast={addToast}/>}
         {page==='torneios'&&<TorneiosPage tournaments={tournaments} setTournaments={setTournaments} pavilhoes={pavilhoes} settings={settings} toast={addToast}/>}
         {page==='pavilhoes'&&<PavilhoesPage pavilhoes={pavilhoes} setPavilhoes={setPavilhoes} settings={settings} toast={addToast}/>}
         {page==='estatisticas'&&<EstatisticasPage games={games} tournaments={tournaments} settings={settings}/>}
