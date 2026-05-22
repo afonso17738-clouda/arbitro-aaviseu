@@ -199,83 +199,132 @@ async function parsePDF(file,settings){
   if(!window.pdfjsLib)throw new Error('PDF.js não carregado');
   const buf=await file.arrayBuffer();
   const pdf=await pdfjsLib.getDocument({data:buf}).promise;
+
+  // 1. Extract ALL text items with precise positions
   const allItems=[];
   for(let p=1;p<=pdf.numPages;p++){
     const page=await pdf.getPage(p);
     const tc=await page.getTextContent();
     const vp=page.getViewport({scale:1});
     tc.items.forEach(item=>{
-      if(item.str.trim())allItems.push({text:item.str,x:item.transform[4],y:vp.height-item.transform[5],page:p});
+      const t=item.str.trim();
+      if(t)allItems.push({text:t,x:Math.round(item.transform[4]),y:Math.round(vp.height-item.transform[5]),page:p});
     });
   }
-  allItems.sort((a,b)=>a.page!==b.page?a.page-b.page:a.y-b.y);
-  const rows=[];let curRow=null,curY=-999,curPage=-1;
-  allItems.forEach(item=>{
-    if(Math.abs(item.y-curY)>5||item.page!==curPage){
-      curRow=[];rows.push(curRow);curY=item.y;curPage=item.page;
-    }
-    curRow.push(item);
-  });
-  const lines=rows.map(r=>r.sort((a,b)=>a.x-b.x).map(i=>i.text.trim()).filter(Boolean).join(' '));
+
   const filters=settings.userFilter||['AFONSO FERNANDES','233690'];
+  const myId=filters.find(x=>/^\d+$/.test(x.trim()));
+
+  // 2. Find anchor items: text items that contain the user's name or ID
+  const anchorItems=allItems.filter(it=>{
+    const up=it.text.toUpperCase();
+    return filters.some(f=>up.includes(f.toUpperCase()));
+  });
+
   const games=[];
-  for(const line of lines){
+  const seenJns=new Set();
+
+  for(const anchor of anchorItems){
+    // 3. Collect ALL items on the same row using a generous Y tolerance (±15px)
+    //    This handles slight vertical misalignment between table cells in PDFs
+    const Y_TOL=15;
+    const rowItems=allItems
+      .filter(it=>it.page===anchor.page&&Math.abs(it.y-anchor.y)<=Y_TOL)
+      .sort((a,b)=>a.x-b.x); // sort LEFT → RIGHT (column order)
+
+    // 4. Reconstruct the full line text from left to right
+    const line=rowItems.map(it=>it.text).join(' ');
     const up=line.toUpperCase();
-    if(!filters.some(f=>up.includes(f.toUpperCase())))continue;
+
+    // Must have a date
     const dateMatch=line.match(/(\d{2}-\d{2}-\d{4})/);
     if(!dateMatch)continue;
     const date=dateMatch[1];
-    const timeMatch=line.match(/(\d{2}:\d{2})/);
+
+    const timeMatch=line.match(/\b(\d{2}:\d{2})\b/);
     const time=timeMatch?timeMatch[1]:'00:00';
-    const arbPattern=/([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇA-Z][A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ\s]+)-(\d{5,6})/g;
-    const arbs=[];let m;
-    while((m=arbPattern.exec(up))!==null)arbs.push({name:m[1].trim(),id:m[2]});
-    const afterTime=line.substring((timeMatch?line.indexOf(time)+5:0));
+
+    // JN: 3-5 digit number after time
+    const afterTime=timeMatch?line.substring(line.indexOf(time)+5):line;
     const jnMatch=afterTime.match(/\b(\d{3,5})\b/);
     const jn=jnMatch?jnMatch[1]:'';
-    // PO: first standalone 1-2 digit number after the teams (PO SERIE JOR pattern)
-    // Tokenise and find consecutive number run after "vs"
+    if(jn&&seenJns.has(jn))continue;
+    if(jn)seenJns.add(jn);
+
+    // ── PO EXTRACTION (3 strategies, most-robust first) ─────────
     let po='';
+
+    // Strategy A: positional — "last 3 pure-number items before the first NAME-ID item"
+    //   Table order: ... PO SERIE JOR  [FirstName] [LastName-ID] ...
+    //   The last 3 numbers before NAME-ID are always PO, SERIE, JOR
     {
-      const toks=line.split(/\s+/);
-      const vsT=toks.findIndex(t=>t.toLowerCase()==='vs');
-      if(vsT>=0){
-        // skip teamB name (non-digit tokens after vs), then collect number run
-        let seenTeamB=false;
+      const firstArbIdx=rowItems.findIndex(it=>/-\d{5,6}$/.test(it.text));
+      if(firstArbIdx>0){
+        const preArbNums=rowItems
+          .slice(0,firstArbIdx)
+          .filter(it=>/^\d{1,3}$/.test(it.text));
+        // last 3 numbers: [..., PO, SERIE, JOR] — take first of last-3
+        const last3=preArbNums.slice(-3);
+        if(last3.length>=1)po=String(parseInt(last3[0].text)).padStart(2,'0');
+      }
+    }
+
+    // Strategy B: text-based — find "vs TEAMB NUMBER NUMBER NUMBER"
+    if(!po){
+      const vsPos=up.indexOf(' VS ');
+      if(vsPos>=0){
+        const afterVs=line.substring(vsPos+4);
+        const toks=afterVs.trim().split(/\s+/);
         const numRun=[];
-        for(let i=vsT+1;i<toks.length;i++){
-          const isNum=/^\d{1,3}$/.test(toks[i]);
-          if(!isNum){
-            if(seenTeamB&&numRun.length>0)break; // end of run
-            if(!isNum)seenTeamB=true;
-          } else {
-            seenTeamB=true;
-            numRun.push(toks[i]);
-            if(numRun.length===3)break;
-          }
+        let passedTeam=false;
+        for(const tok of toks){
+          if(/^\d{1,3}$/.test(tok)){passedTeam=true;numRun.push(tok);if(numRun.length===3)break;}
+          else if(passedTeam&&numRun.length>0)break;
+          else passedTeam=true;
         }
         if(numRun.length>=1)po=String(parseInt(numRun[0])).padStart(2,'0');
       }
-      // Fallback: look for " vs WORD [WORD] (1-2digits) (1-2digits) (1-3digits)"
-      if(!po){
-        const m=line.match(/\bvs\s+(?:[A-ZÀ-Ú]+\s+)*?(\d{1,2})\s+\d{1,2}\s+\d{1,3}/i);
-        if(m)po=String(parseInt(m[1])).padStart(2,'0');
-      }
     }
-    const vsMatch=line.match(/([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇA-Za-záàãâéêíóôõúüç]+(?:\s+[A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇA-Za-z]+)*)\s+vs\s+([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇA-Za-záàãâéêíóôõúüç]+(?:\s+[A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇA-Za-z]+)*?)(?:\s+\d)/i);
+
+    // Strategy C: regex fallback
+    if(!po){
+      const m=line.match(/\b(?:vs|VS|x|X)\s+\S+\s+(\d{1,2})\s+\d{1,2}\s+\d{1,3}/i);
+      if(m)po=String(parseInt(m[1])).padStart(2,'0');
+    }
+    // ── END PO EXTRACTION ────────────────────────────────────────
+
+    // Arbiters: LASTNAME-ID items
+    const arbItems=rowItems.filter(it=>/-\d{5,6}$/.test(it.text));
+    const arbs=arbItems.map(it=>{
+      const dash=it.text.lastIndexOf('-');
+      return{name:it.text.substring(0,dash).trim(),id:it.text.substring(dash+1)};
+    });
+    // Also parse from full line text (catches concatenated names like "GABRIEL MANTOSHKO-222062")
+    if(arbs.length===0){
+      const arbPat=/([A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ][A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ]+)-(\d{5,6})/g;
+      let m2;
+      while((m2=arbPat.exec(up))!==null)arbs.push({name:m2[1].trim(),id:m2[2]});
+    }
+
+    // Teams
+    const vsMatch=line.match(/([A-ZÀ-Úa-zà-ú\d]+(?:\s[A-ZÀ-Úa-zà-ú\d]+)*?)\s+(?:vs|VS|x|X)\s+([A-ZÀ-Úa-zà-ú\d]+(?:\s[A-ZÀ-Úa-zà-ú\d]+)*?)(?=\s+\d)/i);
     const teamA=vsMatch?vsMatch[1].trim():'';
     const teamB=vsMatch?vsMatch[2].trim():'';
+
+    // LOCAL: text between JN and teamA
     let local='';
     if(jn&&teamA){
       const jnIdx=line.indexOf(jn);
       const teamIdx=line.indexOf(teamA,jnIdx);
       if(jnIdx>=0&&teamIdx>jnIdx)local=line.substring(jnIdx+jn.length,teamIdx).trim();
     }
-    const myId=filters.find(x=>/^\d+$/.test(x));
-    const arbitroRole=arbs.findIndex(a=>a.id===myId||filters.some(f=>{
-      const parts=f.toUpperCase().split(' ');
-      return parts.every(p=>a.name.includes(p));
-    }))+1||2;
+
+    const myIdFilter=myId;
+    const arbitroRole=arbs.findIndex(a=>
+      (myIdFilter&&a.id===myIdFilter)||
+      filters.some(f=>!/^\d+$/.test(f)&&f.toUpperCase().split(' ').every(p=>a.name.includes(p)))
+    )+1||2;
+
     const game={
       id:`g_${jn||uid()}_${date.replace(/-/g,'')}`,
       date,time,jn,local,teamA,teamB,po,
@@ -571,16 +620,41 @@ function StatCard({icon,label,value,sub,color='slate'}){
 function PDFUploader({onGames,settings,toast,pavilhoes,setPavilhoes}){
   const[loading,setLoading]=useState(false);
   const[drag,setDrag]=useState(false);
+  const[debugLines,setDebugLines]=useState(null); // raw extracted lines for debug
+  const[preview,setPreview]=useState(null);       // parsed games before confirming
   const inputRef=useRef();
 
   async function processFiles(files){
     if(!files.length)return;
     setLoading(true);
+    setDebugLines(null);setPreview(null);
     const newGames=[];
+    const rawDebug=[];
     for(const file of files){
-      try{const gs=await parsePDF(file,settings);newGames.push(...gs);}
-      catch(e){toast('Erro ao ler PDF: '+e.message,'error');}
+      try{
+        // Extract raw lines for debug
+        const buf=await file.arrayBuffer();
+        const pdf=await pdfjsLib.getDocument({data:buf}).promise;
+        const items=[];
+        for(let p=1;p<=pdf.numPages;p++){
+          const page=await pdf.getPage(p);const tc=await page.getTextContent();
+          const vp=page.getViewport({scale:1});
+          tc.items.forEach(it=>{if(it.str.trim())items.push({text:it.str.trim(),x:Math.round(it.transform[4]),y:Math.round(vp.height-it.transform[5]),page:p});});
+        }
+        // Show a sample of extracted lines
+        const byY={};
+        items.forEach(it=>{
+          const yk=Math.round(it.y/15)*15; // bucket by 15px
+          if(!byY[yk])byY[yk]=[];byY[yk].push(it);
+        });
+        Object.values(byY).slice(0,40).forEach(row=>{
+          rawDebug.push(row.sort((a,b)=>a.x-b.x).map(i=>i.text).join(' | '));
+        });
+        const gs=await parsePDF(file,settings);
+        newGames.push(...gs);
+      }catch(e){toast('Erro ao ler PDF: '+e.message,'error');}
     }
+    setDebugLines(rawDebug);
     // Match pavilhoes
     const newPavs=[];
     for(const g of newGames){
@@ -590,8 +664,7 @@ function PDFUploader({onGames,settings,toast,pavilhoes,setPavilhoes}){
         const exists=pavilhoes.find(p=>p.alias.toUpperCase()===g.local.toUpperCase())||newPavs.find(p=>p.alias.toUpperCase()===g.local.toUpperCase());
         if(!exists){
           const np={id:`pav_${uid()}`,name:g.local,alias:g.local,address:g.local+', Portugal',lat:null,lon:null,distanceKm:null,notes:'',needsAddress:true};
-          newPavs.push(np);
-          g.pavilhaoId=np.id;
+          newPavs.push(np);g.pavilhaoId=np.id;
         }
       }
     }
@@ -600,27 +673,81 @@ function PDFUploader({onGames,settings,toast,pavilhoes,setPavilhoes}){
       toast(`${newPavs.length} novo(s) pavilhão(ões) — confirma as moradas`,'warn');
     }
     setLoading(false);
-    onGames(newGames);
-    if(newGames.length>0)toast(`${newGames.length} jogo(s) importado(s)`);
-    else toast('Nenhum jogo encontrado neste PDF','warn');
+    if(newGames.length>0){
+      setPreview(newGames);
+    } else {
+      toast('Nenhum jogo encontrado. Vê o Debug abaixo.','warn');
+    }
+  }
+
+  function confirmImport(){
+    if(preview)onGames(preview);
+    toast(`${preview?.length||0} jogo(s) importado(s)`);
+    setPreview(null);setDebugLines(null);
   }
 
   return(
-    <div className={`drop-zone p-10 text-center cursor-pointer ${drag?'drag-over':''}`}
-      onDragOver={e=>{e.preventDefault();setDrag(true);}}
-      onDragLeave={()=>setDrag(false)}
-      onDrop={e=>{e.preventDefault();setDrag(false);processFiles([...e.dataTransfer.files].filter(f=>f.type==='application/pdf'));}}
-      onClick={()=>inputRef.current.click()}>
-      {loading?(
-        <div className="flex flex-col items-center gap-3"><Spinner/><span className="text-slate-400">A processar...</span></div>
-      ):(
-        <div className="flex flex-col items-center gap-2">
-          <span className="text-5xl">📄</span>
-          <span className="text-slate-300 font-medium">Arrasta PDFs ou clica para importar</span>
-          <span className="text-slate-500 text-xs">Comunicados de Arbitragem — AA Viseu</span>
+    <div className="space-y-4">
+      {/* Drop zone */}
+      <div className={`drop-zone p-10 text-center cursor-pointer ${drag?'drag-over':''}`}
+        onDragOver={e=>{e.preventDefault();setDrag(true);}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{e.preventDefault();setDrag(false);processFiles([...e.dataTransfer.files].filter(f=>f.type==='application/pdf'));}}
+        onClick={()=>inputRef.current.click()}>
+        {loading?(
+          <div className="flex flex-col items-center gap-3"><Spinner/><span className="text-slate-400">A processar...</span></div>
+        ):(
+          <div className="flex flex-col items-center gap-2">
+            <span className="text-5xl">📄</span>
+            <span className="text-slate-300 font-medium">Arrasta PDFs ou clica para importar</span>
+            <span className="text-slate-500 text-xs">Comunicados de Arbitragem — AA Viseu</span>
+          </div>
+        )}
+        <input ref={inputRef} type="file" accept=".pdf" multiple onChange={e=>processFiles([...e.target.files])}/>
+      </div>
+
+      {/* Preview: games found, confirm before adding */}
+      {preview&&preview.length>0&&(
+        <div className="bg-slate-900 border border-emerald-700/50 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="font-medium text-emerald-300">✅ {preview.length} jogo(s) encontrado(s)</div>
+            <Btn size="sm" onClick={confirmImport}>Confirmar Importação</Btn>
+          </div>
+          <div className="space-y-1 max-h-48 overflow-y-auto">
+            {preview.map((g,i)=>(
+              <div key={i} className="flex items-center gap-3 text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">
+                <span className="text-slate-500 w-16 flex-shrink-0">{g.date}</span>
+                <span className="flex-1 truncate">{g.teamA||'?'} vs {g.teamB||'?'}</span>
+                <span className={`font-mono font-bold flex-shrink-0 ${g.po?'text-indigo-300':'text-red-400'}`}>
+                  PO:{g.po||'❌'} → {g.po?getEscalaoForPO(g.po,settings):'sem mapeamento'}
+                </span>
+              </div>
+            ))}
+          </div>
+          {preview.some(g=>!g.po)&&(
+            <div className="text-amber-400 text-xs">⚠️ Alguns jogos sem PO — edita-os manualmente depois.</div>
+          )}
         </div>
       )}
-      <input ref={inputRef} type="file" accept=".pdf" multiple onChange={e=>processFiles([...e.target.files])}/>
+
+      {/* Debug: raw PDF lines */}
+      {debugLines&&(
+        <details className="bg-slate-900 border border-slate-700 rounded-xl overflow-hidden">
+          <summary className="px-4 py-3 cursor-pointer text-sm text-slate-400 hover:text-white select-none">
+            🔍 Debug — linhas brutas extraídas do PDF ({debugLines.length} linhas)
+          </summary>
+          <div className="p-3 max-h-64 overflow-y-auto">
+            {debugLines.map((l,i)=>(
+              <div key={i} className="text-xs font-mono text-slate-400 py-0.5 border-b border-slate-800/50 truncate hover:text-slate-200 hover:whitespace-normal">
+                {i+1}: {l}
+              </div>
+            ))}
+          </div>
+          <div className="px-4 py-2 bg-slate-800/50 text-xs text-slate-500">
+            Procura a linha do teu jogo. O PO é o número após as equipas (ex: "ACOF | vs | CBVISEU | 8 | 0 | 12").
+          </div>
+        </details>
+      )}
     </div>
   );
 }
